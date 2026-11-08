@@ -7,6 +7,8 @@ LangGraph 閉環：出題者 → 撰寫者 → 雙評審（Gemini + Claude）→
 - 雙評審取「較低分」作為決策分數（保守），任一評審抓到【錯字】一律不過關
 - 修改者只收具體缺點清單，不收籠統評語
 - Gemini / Claude 都有 429 自動換備援模型
+- OpenCC：程式直接抓簡體字（不花 token）
+- Langfuse：記錄每次模型呼叫的 token 與費用（沒填金鑰就自動略過）
 """
 from __future__ import annotations
 
@@ -49,6 +51,12 @@ class Config:
         "#歸仁土地仲介", "#台南土地", "#台南農地", "#台南建地", "#台南工業地", "#幸福家不動產"])
     ai_assistant_url: str = "https://www.myhomes.com.tw/mo/ai_qna/16612"
     first_comment_template: str = "🤖 AI特助24hr服務：有土地問題隨時問👉 {url}"
+    # Langfuse（記帳本）：三個都留空 = 不啟用
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+    # OpenCC 誤判白名單：台灣正體也會用、但會被當成簡體的字
+    opencc_whitelist: str = ""
 
     @classmethod
     def from_secrets(cls, s: Any) -> "Config":
@@ -78,6 +86,10 @@ class Config:
         base.ai_assistant_url = g("AI_ASSISTANT_URL", base.ai_assistant_url)
         tags = as_list(g("FIXED_HASHTAGS"), base.fixed_hashtags)
         base.fixed_hashtags = [t if t.startswith("#") else f"#{t}" for t in tags]
+        base.langfuse_public_key = g("LANGFUSE_PUBLIC_KEY", "") or ""
+        base.langfuse_secret_key = g("LANGFUSE_SECRET_KEY", "") or ""
+        base.langfuse_host = g("LANGFUSE_HOST", base.langfuse_host) or base.langfuse_host
+        base.opencc_whitelist = g("OPENCC_WHITELIST", "") or ""
         return base
 
     def signature(self) -> str:
@@ -124,12 +136,59 @@ def _is_fallback_error(e: Exception) -> bool:
         k in s for k in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "OVERLOADED", "RATE_LIMIT", "NOT_FOUND"))
 
 
+class Tracer:
+    """Langfuse 記帳本。沒填金鑰、套件沒裝、連線失敗 → 全部安靜略過，不影響發文。"""
+
+    def __init__(self, cfg: Config):
+        self.lf = None
+        if not (cfg.langfuse_public_key and cfg.langfuse_secret_key):
+            return
+        try:
+            from langfuse import Langfuse
+            kw = dict(public_key=cfg.langfuse_public_key, secret_key=cfg.langfuse_secret_key)
+            try:
+                self.lf = Langfuse(**kw, base_url=cfg.langfuse_host)
+            except TypeError:  # 舊版 SDK 參數叫 host
+                self.lf = Langfuse(**kw, host=cfg.langfuse_host)
+        except Exception:  # noqa: BLE001
+            self.lf = None
+
+    @property
+    def on(self) -> bool:
+        return self.lf is not None
+
+    def record(self, name: str, model: str, prompt: str, output: str, usage: dict, seconds: float):
+        if not self.lf:
+            return
+        try:
+            with self.lf.start_as_current_observation(
+                    as_type="generation", name=name, model=model, input=prompt[:6000]) as gen:
+                gen.update(output=output[:6000], usage_details=usage,
+                           metadata={"seconds": round(seconds, 1)})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def flush(self):
+        if self.lf:
+            try:
+                self.lf.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class LLM:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._gemini = None
         self._claude = None
         self.events: list[str] = []  # 模型切換紀錄，給介面顯示
+        self.tracer = Tracer(cfg)
+        self.usage: dict[str, int] = {"input": 0, "output": 0}  # 本次生成累計 token
+
+    def _add_usage(self, tag: str, model: str, prompt: str, text: str, u: dict, t0: float):
+        self.usage["input"] += u.get("input", 0)
+        self.usage["output"] += u.get("output", 0) + u.get("output_thinking", 0)
+        self.tracer.record(tag, model, prompt, text, u, time.time() - t0)
 
     # ---------- Gemini ----------
     def _gem(self):
@@ -139,7 +198,7 @@ class LLM:
         return self._gemini
 
     def gemini(self, prompt: str, system: str = "", json_mode: bool = False,
-               search: bool = False, temperature: float = 0.7) -> tuple[str, str]:
+               search: bool = False, temperature: float = 0.7, tag: str = "gemini") -> tuple[str, str]:
         from google.genai import types
 
         search = search and self.cfg.use_search
@@ -156,12 +215,21 @@ class LLM:
                     elif json_mode:
                         kwargs["response_mime_type"] = "application/json"
                     try:
+                        t0 = time.time()
                         r = self._gem().models.generate_content(
                             model=model, contents=prompt,
                             config=types.GenerateContentConfig(**kwargs))
                         text = r.text or ""
                         if not text.strip():
                             raise RuntimeError("empty response")
+                        um = getattr(r, "usage_metadata", None)
+                        u = {k: int(getattr(um, f, 0) or 0) for k, f in (
+                            ("input", "prompt_token_count"),
+                            ("output", "candidates_token_count"),
+                            ("output_thinking", "thoughts_token_count"),
+                            ("input_tool", "tool_use_prompt_token_count"))} if um else {}
+                        u["input"] = u.get("input", 0) + u.pop("input_tool", 0)
+                        self._add_usage(tag, model, prompt, text, u, t0)
                         return text, model
                     except Exception as e:  # noqa: BLE001
                         last_err = e
@@ -184,16 +252,22 @@ class LLM:
             self._claude = anthropic.Anthropic(api_key=self.cfg.anthropic_api_key)
         return self._claude
 
-    def claude(self, prompt: str, system: str = "", temperature: float = 0.2) -> tuple[str, str]:
+    def claude(self, prompt: str, system: str = "", temperature: float = 0.2,
+               tag: str = "claude") -> tuple[str, str]:
         last_err: Exception | None = None
         for attempt in range(2):
             for model in self.cfg.claude_models:
                 try:
+                    t0 = time.time()
                     msg = self._cl().messages.create(
                         model=model, max_tokens=3000, temperature=temperature,
                         system=system or "You are a helpful assistant.",
                         messages=[{"role": "user", "content": prompt}])
                     text = "".join(getattr(b, "text", "") for b in msg.content)
+                    us = getattr(msg, "usage", None)
+                    u = {"input": int(getattr(us, "input_tokens", 0) or 0),
+                         "output": int(getattr(us, "output_tokens", 0) or 0)}
+                    self._add_usage(tag, model, prompt, text, u, t0)
                     return text, model
                 except Exception as e:  # noqa: BLE001
                     last_err = e
@@ -356,10 +430,49 @@ def assemble(draft: dict, cfg: Config) -> str:
     return f"{draft.get('title', '').strip()}\n\n{body}\n\n{cfg.signature()}\n\n{' '.join(tags)}"
 
 
-def rule_check(draft: dict) -> list[str]:
+# 台灣正體也常用、但 OpenCC 簡轉繁會改掉的字 → 不當成簡體字
+TW_OK_CHARS = set("台后里干面余只才斗谷周准系松范卷志借吁咸向注表游布占折制致征采了云丰凶出舍朴姜托划夸板回克秋胡御郁杰欲念帘沈丑卜几刮筑蒙霉合")
+_CC: Any = None
+
+
+def _opencc():
+    global _CC
+    if _CC is None:
+        try:
+            from opencc import OpenCC
+            _CC = OpenCC("s2t")
+        except Exception:  # noqa: BLE001
+            _CC = False  # 沒裝套件就略過此檢查
+    return _CC
+
+
+def simplified_chars(text: str, extra_ok: str = "") -> list[str]:
+    """回傳「簡體字→正體字」清單（不重複），例如 ['发→發']"""
+    cc = _opencc()
+    if not cc or not text:
+        return []
+    ok = TW_OK_CHARS | set(extra_ok)
+    out, seen = [], set()
+    for line in text.splitlines():
+        conv = cc.convert(line)
+        if len(conv) != len(line):  # 長度不同時改逐字比對
+            pairs = [(c, cc.convert(c)) for c in line]
+        else:
+            pairs = list(zip(line, conv))
+        for a, b in pairs:
+            if a != b and a not in ok and a not in seen:
+                seen.add(a)
+                out.append(f"{a}→{b}")
+    return out
+
+
+def rule_check(draft: dict, extra_ok: str = "") -> list[str]:
     """程式硬性檢查（不靠模型）"""
     issues = []
     body = draft.get("body", "")
+    sc = simplified_chars(f"{draft.get('title', '')}\n{body}\n{' '.join(draft.get('hashtags', []))}", extra_ok)
+    if sc:
+        issues.append(f"【錯字】出現簡體字：{'、'.join(sc)}，請全部改成台灣正體字。")
     if URL_RE.search(body):
         issues.append(f"【規則】內文出現網址「{URL_RE.search(body).group(0)}」，連結不可放內文，請刪除。")
     if "**" in body or re.search(r"^#{1,6}\s", body, re.M):
@@ -395,14 +508,17 @@ class Nodes:
             hint=f"使用者指定方向：{hint}" if hint else "",
             avoid="\n".join(f"- {t}" for t in avoid[-30:]) or "（無）",
         )
-        text, model = self.llm.gemini(prompt, system=PERSONA, json_mode=True, search=True, temperature=0.9)
+        self.llm.usage = {"input": 0, "output": 0}  # 新的一篇，從 0 開始算
+        text, model = self.llm.gemini(prompt, system=PERSONA, json_mode=True, search=True,
+                                      temperature=0.9, tag="出題")
         topic = parse_json(text)
         return {"topic": topic, "round": 0, "history": [], "feedback": [], "passed": False,
                 "status": "running",
                 "log": self._log(state, f"🧭 出題者（{model}）：{topic.get('title')}｜關鍵字 {topic.get('keywords')}")}
 
-    def _write(self, prompt: str) -> tuple[dict, str]:
-        text, model = self.llm.gemini(prompt, system=PERSONA, json_mode=True, search=True, temperature=0.7)
+    def _write(self, prompt: str, tag: str = "撰寫") -> tuple[dict, str]:
+        text, model = self.llm.gemini(prompt, system=PERSONA, json_mode=True, search=True,
+                                      temperature=0.7, tag=tag)
         d = parse_json(text)
         d.setdefault("hashtags", [])
         return d, model
@@ -426,9 +542,9 @@ class Nodes:
         try:
             if who == "gemini":
                 text, model = self.llm.gemini(prompt, system=JUDGE_SYSTEM, json_mode=True,
-                                              search=True, temperature=0.1)
+                                              search=True, temperature=0.1, tag="評審-Gemini")
             else:
-                text, model = self.llm.claude(prompt, system=JUDGE_SYSTEM, temperature=0.1)
+                text, model = self.llm.claude(prompt, system=JUDGE_SYSTEM, temperature=0.1, tag="評審-Claude")
             r = parse_json(text)
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e)[:300], "score": None, "feedback": []}
@@ -450,7 +566,7 @@ class Nodes:
             raise AllModelsFailed(f"兩位評審都失敗：Gemini={g.get('error')}；Claude={c.get('error')}")
         score = min(valid)  # 保守：取較低分
 
-        rules = rule_check(state["draft"])
+        rules = rule_check(state["draft"], self.cfg.opencc_whitelist)
         feedback = rules + [f"[Gemini] {x}" for x in g.get("feedback", [])] + \
                    [f"[Claude] {x}" for x in c.get("feedback", [])]
         feedback = list(dict.fromkeys(feedback))  # 去重保序
@@ -480,7 +596,7 @@ class Nodes:
             rules=self._rules(), title=d.get("title", ""), body=d.get("body", ""),
             hashtags=" ".join(d.get("hashtags", [])),
             feedback="\n".join(f"{i}. {x}" for i, x in enumerate(state["feedback"], 1)))
-        draft, model = self._write(prompt)
+        draft, model = self._write(prompt, tag="修改")
         rnd = state.get("round", 1) + 1
         return {"draft": draft, "full_text": assemble(draft, self.cfg), "round": rnd,
                 "log": self._log(state, f"🛠️ 修改者（{model}）依 {len(state['feedback'])} 條缺點改寫 → 第 {rnd} 版")}
@@ -490,10 +606,15 @@ class Nodes:
         hist = state.get("history", [])
         best = max(hist, key=lambda h: (h["passed"], not h["has_typo"], h["score"], h["round"]))
         note = "" if best["round"] == hist[-1]["round"] else f"（第 {hist[-1]['round']} 版退步，改用第 {best['round']} 版）"
+        u = self.llm.usage
+        cost_note = f"💰 本篇共用 token：輸入 {u['input']:,}／輸出 {u['output']:,}" + \
+                    ("（明細已記到 Langfuse）" if self.llm.tracer.on else "")
+        self.llm.tracer.flush()
         return {"final_text": best["full_text"], "first_comment": self.cfg.first_comment(),
                 "status": "awaiting_review",
                 "log": self._log(state, f"📦 定稿：第 {best['round']} 版，決策分 {best['score']}"
-                                        f"{'' if best['passed'] else '（未達標，請人工把關）'}{note}")}
+                                        f"{'' if best['passed'] else '（未達標，請人工把關）'}{note}",
+                                  cost_note)}
 
     # 人工確認（LangGraph interrupt）
     def human_review(self, state: PostState) -> dict:
