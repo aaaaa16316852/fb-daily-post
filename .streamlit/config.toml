@@ -1,0 +1,10 @@
+# 歸仁土地仲介 工具共用主題（與謄本解析系統同一套配色）
+[theme]
+base = "light"
+primaryColor = "#2563eb"
+backgroundColor = "#f8fafc"
+secondaryBackgroundColor = "#eef2f7"
+textColor = "#0f172a"
+borderColor = "#e2e8f0"
+baseRadius = "0.6rem"
+font = "sans-serif"

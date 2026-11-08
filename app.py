@@ -10,8 +10,10 @@ from datetime import datetime
 import streamlit as st
 
 import core
+import ui_theme as ui
 
 st.set_page_config(page_title="粉專每日文章生成｜歸仁土地仲介", page_icon="📝", layout="wide")
+ui.apply_theme()
 
 HISTORY_FILE = "history.json"  # Streamlit Cloud 重啟會清空，記得定期下載備份
 NODE_LABEL = {
@@ -22,14 +24,16 @@ NODE_LABEL = {
     "finalize": "📦 定稿",
     "human_review": "👀 等待人工確認",
 }
+STEP_LABELS = ["🧭 出題", "✍️ 撰寫", "⚖️ 雙評審", "🛠️ 修改", "👀 人工確認"]
+# 某個節點「做完」之後，步驟條要亮到哪一格
+STEP_AFTER = {"topic": 1, "writer": 2, "judge": 2, "reviser": 2, "finalize": 4, "human_review": 5}
 
 
 # ───────────────────────── 登入 ─────────────────────────
 def check_password() -> bool:
     if st.session_state.get("auth_ok"):
         return True
-    st.title("📝 粉專每日文章生成系統")
-    st.caption("歸仁土地仲介｜丘正其")
+    ui.hero("📝 粉專每日文章生成系統", "歸仁土地仲介｜丘正其")
     pw = st.text_input("請輸入密碼", type="password")
     if st.button("登入", type="primary"):
         if hmac.compare_digest(pw, str(st.secrets.get("APP_PASSWORD", ""))):
@@ -85,9 +89,11 @@ def state_values() -> dict:
 
 
 # ───────────────────────── 執行圖 ─────────────────────────
-def run_graph(inp):
+def run_graph(inp, start_step: int = 0):
     ss.error = ""
     seen = len(state_values().get("log", []))
+    step_slot = st.empty()
+    ui.steps(STEP_LABELS, start_step, step_slot)
     with st.status("AI 團隊工作中…", expanded=True) as box:
         try:
             for ev in ss.graph.stream(inp, ss.thread, stream_mode="updates"):
@@ -95,6 +101,7 @@ def run_graph(inp):
                     if node == "__interrupt__":
                         continue
                     box.update(label=NODE_LABEL.get(node, node) + "…")
+                    ui.steps(STEP_LABELS, STEP_AFTER.get(node, start_step), step_slot)
                     log = (upd or {}).get("log") if isinstance(upd, dict) else None
                     if log:
                         for line in log[seen:]:
@@ -146,17 +153,17 @@ with st.sidebar:
 
 
 # ───────────────────────── 主畫面 ─────────────────────────
-st.title("📝 粉專每日專業知識文")
-st.caption("出題者 → 撰寫者 → 雙評審（Gemini + Claude）→ 修改者（最多 3 輪）→ 人工確認")
+ui.hero("📝 粉專每日專業知識文", "出題者 → 撰寫者 → 雙評審（Gemini + Claude）→ 修改者（最多 3 輪）→ 人工確認")
 
 if ss.error:
     st.error(f"執行失敗：{ss.error}")
     st.caption("若是 429 額度問題，備援模型也用完了，請稍後再試或到 secrets 調整模型清單。")
 
 if ss.phase == "idle":
+    ui.steps(STEP_LABELS, -1)
     if today_done:
         st.warning(f"今天已經產生過：「{today_done[-1]['title']}」。一天一篇，確定要再產生嗎？")
-    if st.button("🚀 生成今日文章", type="primary", use_container_width=True):
+    if st.button("🚀 生成今日文章", type="primary", width="stretch"):
         avoid = [h["title"] for h in history] + [x.strip() for x in extra_avoid.splitlines() if x.strip()]
         ss.thread = core.new_thread()
         ss.edit_mode = False
@@ -181,7 +188,7 @@ def render_rounds(v: dict):
             "缺點數": len(h["feedback"]),
             "結果": "✅ 過關" if h["passed"] else "❌ 未過",
         })
-    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.dataframe(rows, hide_index=True, width="stretch")
 
     st.subheader("🧾 修改紀錄")
     for h in hist:
@@ -216,10 +223,12 @@ if ss.phase == "review":
     hist = v.get("history", [])
     best = next((h for h in hist if h["full_text"] == v.get("final_text")), hist[-1] if hist else {})
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("決策分數", best.get("score", "-"), help="兩位評審取較低分")
-    c2.metric("跑了幾輪", len(hist))
-    c3.metric("品質門檻", "✅ 達標" if best.get("passed") else "⚠️ 未達標")
+    ui.steps(STEP_LABELS, 4)
+    ui.metric_cards([
+        ("決策分數", best.get("score", "-"), "兩位評審取較低分"),
+        ("跑了幾輪", len(hist), f"最多 {cfg.max_rounds} 輪"),
+        ("品質門檻", "✅ 達標" if best.get("passed") else "⚠️ 未達標", f"過關分數 {cfg.pass_score}"),
+    ], key="review_mc")
     if not best.get("passed"):
         st.warning("已跑滿輪數仍未達標，請特別檢查下方最後一輪的缺點清單再決定。")
 
@@ -227,24 +236,26 @@ if ss.phase == "review":
     if ss.edit_mode:
         edited = st.text_area("直接修改內容", v.get("final_text", ""), height=520, key="edit_box")
         e1, e2 = st.columns(2)
-        if e1.button("💾 儲存修改並發布", type="primary", use_container_width=True):
-            run_graph(core.resume_cmd("edit", text=edited))
+        if e1.button("💾 儲存修改並發布", type="primary", width="stretch"):
+            run_graph(core.resume_cmd("edit", text=edited), start_step=4)
             ss.edit_mode = False
             st.rerun()
-        if e2.button("取消修改", use_container_width=True):
+        if e2.button("取消修改", width="stretch"):
             ss.edit_mode = False
             st.rerun()
     else:
-        st.text_area("最終稿", v.get("final_text", ""), height=520, disabled=True, label_visibility="collapsed")
+        ui.fb_preview(v.get("final_text", ""), cfg.agent_title, v.get("first_comment", ""))
+        with st.expander("📋 純文字版（右上角可複製）"):
+            st.code(v.get("final_text", ""), language=None)
         regen_hint = st.text_input("重新生成時的方向（可空白）", key="regen_hint")
         b1, b2, b3 = st.columns(3)
-        if b1.button("✅ 確認發布", type="primary", use_container_width=True):
-            run_graph(core.resume_cmd("approve"))
+        if b1.button("✅ 確認發布", type="primary", width="stretch"):
+            run_graph(core.resume_cmd("approve"), start_step=4)
             st.rerun()
-        if b2.button("✏️ 手動修改", use_container_width=True):
+        if b2.button("✏️ 手動修改", width="stretch"):
             ss.edit_mode = True
             st.rerun()
-        if b3.button("🔄 重新生成", use_container_width=True):
+        if b3.button("🔄 重新生成", width="stretch"):
             run_graph(core.resume_cmd("regenerate", hint=regen_hint))
             st.rerun()
 
@@ -269,8 +280,11 @@ if ss.phase == "published":
         })
         ss.saved_thread = ss.thread["configurable"]["thread_id"]
 
+    ui.steps(STEP_LABELS, 5)
     st.success("✅ 已確認！複製下方內容貼到粉專（右上角有複製按鈕）。")
-    st.subheader("📄 貼文內容")
+    st.subheader("👀 發布預覽")
+    ui.fb_preview(v.get("final_text", ""), cfg.agent_title, v.get("first_comment", ""))
+    st.subheader("📄 貼文內容（複製用）")
     st.code(v.get("final_text", ""), language=None)
     if v.get("first_comment"):
         st.subheader("💬 發文後立刻貼到第一則留言")
