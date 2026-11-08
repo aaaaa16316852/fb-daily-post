@@ -153,18 +153,40 @@ class Tracer:
         except Exception:  # noqa: BLE001
             self.lf = None
 
+    trace_id: str = ""  # 同一篇文章的所有呼叫掛在同一個 trace 底下
+
     @property
     def on(self) -> bool:
         return self.lf is not None
 
-    def record(self, name: str, model: str, prompt: str, output: str, usage: dict, seconds: float):
+    def new_article(self):
+        """新的一篇開始：產生新的 trace_id，之後的呼叫都歸到這篇"""
+        self.trace_id = ""
         if not self.lf:
             return
         try:
-            with self.lf.start_as_current_observation(
-                    as_type="generation", name=name, model=model, input=prompt[:6000]) as gen:
+            self.trace_id = self.lf.create_trace_id()
+        except Exception:  # noqa: BLE001
+            self.trace_id = ""
+
+    def record(self, name: str, model: str, prompt: str, output: str, usage: dict, seconds: float):
+        if not self.lf:
+            return
+        kw = dict(as_type="generation", name=name, model=model, input=prompt[:6000])
+        try:
+            try:
+                cm = self.lf.start_as_current_observation(
+                    **kw, trace_context={"trace_id": self.trace_id}) if self.trace_id \
+                    else self.lf.start_as_current_observation(**kw)
+            except TypeError:  # SDK 不支援 trace_context → 退回各自一筆
+                cm = self.lf.start_as_current_observation(**kw)
+            with cm as gen:
                 gen.update(output=output[:6000], usage_details=usage,
                            metadata={"seconds": round(seconds, 1)})
+                try:
+                    gen.update_trace(name="粉專文章")
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001
             pass
 
@@ -509,6 +531,7 @@ class Nodes:
             avoid="\n".join(f"- {t}" for t in avoid[-30:]) or "（無）",
         )
         self.llm.usage = {"input": 0, "output": 0}  # 新的一篇，從 0 開始算
+        self.llm.tracer.new_article()
         text, model = self.llm.gemini(prompt, system=PERSONA, json_mode=True, search=True,
                                       temperature=0.9, tag="出題")
         topic = parse_json(text)
