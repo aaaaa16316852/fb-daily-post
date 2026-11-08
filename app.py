@@ -85,6 +85,40 @@ def state_values() -> dict:
 
 
 # ───────────────────────── 執行圖 ─────────────────────────
+# ───────────────────────── 配圖 ─────────────────────────
+def card_png(card: dict):
+    """畫配圖；失敗時在畫面顯示原因，不讓整頁掛掉"""
+    if not card or not card.get("headline") or not card.get("points"):
+        st.warning("這一版沒有產生配圖文字，可以按「✏️ 手動修改」補上，或重新生成。")
+        return None
+    try:
+        return core.render_card(card, date=datetime.now(core.TW_TZ).strftime("%Y.%m.%d"))
+    except Exception as e:  # noqa: BLE001
+        st.error(f"配圖產生失敗：{e}")
+        return None
+
+
+def show_card(card: dict, key: str):
+    png = card_png(card)
+    if png:
+        st.image(png, use_container_width=True)
+        st.download_button("⬇️ 下載配圖 PNG", png, file_name=f"fb_card_{today}.png", mime="image/png",
+                           use_container_width=True, key=f"dl_{key}")
+
+
+def card_editor(card: dict) -> dict:
+    """手動修改配圖文字"""
+    c = dict(card or {})
+    st.markdown("**🖼️ 配圖文字**")
+    c["tag"] = st.text_input("分類標籤", c.get("tag", "土地知識"), key="ce_tag")
+    c["headline"] = st.text_input("大標題（要換行的地方打 \\n）", c.get("headline", ""), key="ce_head")
+    c["highlight"] = st.text_input("強調色關鍵字（必須是大標題裡的字）", c.get("highlight", ""), key="ce_hl")
+    c["subtitle"] = st.text_input("副標", c.get("subtitle", ""), key="ce_sub")
+    pts = st.text_area("重點（一行一點，3～5 點）", "\n".join(c.get("points") or []), height=170, key="ce_pts")
+    c["points"] = [x.strip() for x in pts.splitlines() if x.strip()][:5]
+    return c
+
+
 def run_graph(inp):
     ss.error = ""
     seen = len(state_values().get("log", []))
@@ -147,7 +181,7 @@ with st.sidebar:
 
 # ───────────────────────── 主畫面 ─────────────────────────
 st.title("📝 粉專每日專業知識文")
-st.caption("出題者 → 撰寫者 → 雙評審（Gemini + Claude）→ 修改者（最多 3 輪）→ 人工確認")
+st.caption("出題者 → 撰寫者（文章＋配圖重點）→ 雙評審（Gemini + Claude）→ 修改者（最多 3 輪）→ 人工確認")
 
 if ss.error:
     st.error(f"執行失敗：{ss.error}")
@@ -203,6 +237,9 @@ def render_rounds(v: dict):
                     st.write(f"{i}. {f}")
             else:
                 st.write("無")
+            if h.get("card"):
+                st.markdown("**本版配圖文字**")
+                st.caption(core.card_text({"card": h["card"]}).replace("\n", "　"))
             st.text_area("本版全文", h["full_text"], height=250, disabled=True,
                          key=f"round_text_{h['round']}_{v.get('regen_count', 0)}")
 
@@ -223,19 +260,30 @@ if ss.phase == "review":
     if not best.get("passed"):
         st.warning("已跑滿輪數仍未達標，請特別檢查下方最後一輪的缺點清單再決定。")
 
-    st.subheader("📄 最終稿")
+    st.subheader("📄 最終稿＋配圖")
     if ss.edit_mode:
-        edited = st.text_area("直接修改內容", v.get("final_text", ""), height=520, key="edit_box")
+        left, right = st.columns([3, 2])
+        with left:
+            edited = st.text_area("直接修改內容", v.get("final_text", ""), height=520, key="edit_box")
+        with right:
+            new_card = card_editor(v.get("final_card") or {})
+            st.caption("預覽")
+            show_card(new_card, "edit")
         e1, e2 = st.columns(2)
         if e1.button("💾 儲存修改並發布", type="primary", use_container_width=True):
-            run_graph(core.resume_cmd("edit", text=edited))
+            run_graph(core.resume_cmd("edit", text=edited, card=new_card))
             ss.edit_mode = False
             st.rerun()
         if e2.button("取消修改", use_container_width=True):
             ss.edit_mode = False
             st.rerun()
     else:
-        st.text_area("最終稿", v.get("final_text", ""), height=520, disabled=True, label_visibility="collapsed")
+        left, right = st.columns([3, 2])
+        with left:
+            st.text_area("最終稿", v.get("final_text", ""), height=640, disabled=True,
+                         label_visibility="collapsed")
+        with right:
+            show_card(v.get("final_card") or {}, "review")
         regen_hint = st.text_input("重新生成時的方向（可空白）", key="regen_hint")
         b1, b2, b3 = st.columns(3)
         if b1.button("✅ 確認發布", type="primary", use_container_width=True):
@@ -266,12 +314,18 @@ if ss.phase == "published":
             "keywords": v.get("topic", {}).get("keywords", []),
             "scores": [h["score"] for h in hist],
             "text": v.get("final_text", ""),
+            "card": v.get("final_card") or {},
         })
         ss.saved_thread = ss.thread["configurable"]["thread_id"]
 
-    st.success("✅ 已確認！複製下方內容貼到粉專（右上角有複製按鈕）。")
-    st.subheader("📄 貼文內容")
-    st.code(v.get("final_text", ""), language=None)
+    st.success("✅ 已確認！先下載配圖，再複製下方內容貼到粉專（右上角有複製按鈕）。")
+    left, right = st.columns([3, 2])
+    with left:
+        st.subheader("📄 貼文內容")
+        st.code(v.get("final_text", ""), language=None)
+    with right:
+        st.subheader("🖼️ 配圖")
+        show_card(v.get("final_card") or {}, "published")
     if v.get("first_comment"):
         st.subheader("💬 發文後立刻貼到第一則留言")
         st.code(v["first_comment"], language=None)

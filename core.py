@@ -25,6 +25,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+import card as cardmod
+
 TW_TZ = timezone(timedelta(hours=8))
 
 
@@ -276,13 +278,15 @@ class LLM:
 
     def claude(self, prompt: str, system: str = "", temperature: float = 0.2,
                tag: str = "claude") -> tuple[str, str]:
+        # 新版 Claude 模型／SDK 不再接受 temperature 參數（會報 unexpected keyword argument），
+        # 所以預設不送；temperature 參數保留只是為了相容舊呼叫。
         last_err: Exception | None = None
         for attempt in range(2):
             for model in self.cfg.claude_models:
                 try:
                     t0 = time.time()
                     msg = self._cl().messages.create(
-                        model=model, max_tokens=3000, temperature=temperature,
+                        model=model, max_tokens=3000,
                         system=system or "You are a helpful assistant.",
                         messages=[{"role": "user", "content": prompt}])
                     text = "".join(getattr(b, "text", "") for b in msg.content)
@@ -350,6 +354,14 @@ WRITER_RULES = """【寫作規範】
 6. 內文 600～1000 字，段落短、好滑手機閱讀。
 7. 內文不得放任何網址連結。不要寫簽名檔、不要寫電話、不要在內文放 Hashtag（程式會自動加）。
 8. hashtags 依內容挑 4～8 個精準標籤（要和熱門關鍵字相關），不要和固定標籤重複：{fixed}
+9. card 是文章配圖上的文字（程式會排成圖片），目標是讓人滑到就想停下來點開：
+   - headline：配圖大標題，10～14 字，含熱門關鍵字，可用數字或問句製造好奇（例：農地繼承免稅？5個關鍵）。
+     想在語意處換行時，用 \\n 標出斷行位置（例：房地合一稅2.0\\n賣地前必看）。
+   - highlight：headline 裡要用強調色標出的關鍵字（必須是 headline 原文的一段，2～6 字）。
+   - subtitle：一句話點出讀者痛點或後果，20 字內。
+   - points：3～5 個重點，每點 20 字內，要具體（有數字、年限、條件更好），和內文一致，不可與內文矛盾。
+   - tag：分類標籤 4 字內（例：稅務知識、農地法規、貸款攻略、土地買賣）。
+   - 配圖文字同樣零錯字、台灣正體字，不放網址、電話、emoji。
 """
 
 WRITER_PROMPT = """{rules}
@@ -359,7 +371,7 @@ WRITER_PROMPT = """{rules}
 【大綱】{outline}
 
 請撰寫文章。只回 JSON，不要任何其他文字：
-{{"title": "標題", "body": "內文（用 \\n 換行）", "hashtags": ["#標籤1", "#標籤2"]}}"""
+{{"title": "標題", "body": "內文（用 \\n 換行）", "hashtags": ["#標籤1", "#標籤2"], "card": {{"headline": "配圖大標題", "highlight": "強調字", "subtitle": "一句痛點", "points": ["重點1", "重點2", "重點3"], "tag": "分類"}}}}"""
 
 REVISER_PROMPT = """{rules}
 以下是上一版文章，評審指出了具體缺點。請「逐條」修正這些缺點，其餘寫得好的部分保留，不要整篇重寫成另一篇。
@@ -368,12 +380,13 @@ REVISER_PROMPT = """{rules}
 【上一版內文】
 {body}
 【上一版標籤】{hashtags}
+【上一版配圖文字】{card}
 
 【必須修正的具體缺點】
 {feedback}
 
 只回 JSON，不要任何其他文字：
-{{"title": "標題", "body": "內文（用 \\n 換行）", "hashtags": ["#標籤1", "#標籤2"]}}"""
+{{"title": "標題", "body": "內文（用 \\n 換行）", "hashtags": ["#標籤1", "#標籤2"], "card": {{"headline": "配圖大標題", "highlight": "強調字", "subtitle": "一句痛點", "points": ["重點1", "重點2", "重點3"], "tag": "分類"}}}}"""
 
 JUDGE_SYSTEM = (
     "你是嚴格的台灣不動產法規與社群文案評審，熟悉土地法、平均地權條例、農業發展條例、所得稅法（房地合一）、"
@@ -395,6 +408,8 @@ JUDGE_PROMPT = """請評審以下 Facebook 粉專文章（含程式自動加上�
 4. 是否用了 FB 不支援的 Markdown 符號（**、## 等）。
 5. 簽名檔應包含：Google搜尋「歸仁土地仲介」、姓名、專營項目、電話、幸福家店名、經紀業名稱、證號。
 6. Hashtag 是否精準對應內容。
+7. 文末【配圖文字】會排成貼文配圖：檢查錯字、重點是否和內文一致且正確、大標題是否夠吸睛讓人想點開。
+   配圖問題在 feedback 開頭寫「【配圖】」（配圖錯字一樣寫「【錯字】」）。
 
 【feedback 規則】每一條都必須具體：指出「哪一段／哪一句」有什麼問題、應該怎麼改。
 禁止籠統評語（例如「可以更吸引人」「內容不錯」）。沒有缺點就給空陣列。
@@ -417,13 +432,14 @@ class PostState(TypedDict, total=False):
     hint: str
     avoid_titles: list[str]
     topic: dict
-    draft: dict            # {"title","body","hashtags"}
+    draft: dict            # {"title","body","hashtags","card"}
     full_text: str
     round: int
     history: list[dict]    # 每輪：round, title, full_text, gemini, claude, score, passed, feedback, action
     feedback: list[str]
     passed: bool
     final_text: str
+    final_card: dict       # 定稿配圖文字（app 用 card.render 畫成圖）
     first_comment: str
     status: str            # running / awaiting_review / published / regenerate
     log: list[str]
@@ -492,7 +508,9 @@ def rule_check(draft: dict, extra_ok: str = "") -> list[str]:
     """程式硬性檢查（不靠模型）"""
     issues = []
     body = draft.get("body", "")
-    sc = simplified_chars(f"{draft.get('title', '')}\n{body}\n{' '.join(draft.get('hashtags', []))}", extra_ok)
+    cd = cardmod.CardData.from_dict(draft.get("card") or {})
+    sc = simplified_chars(f"{draft.get('title', '')}\n{body}\n{' '.join(draft.get('hashtags', []))}\n"
+                          f"{cd.all_text()}", extra_ok)
     if sc:
         issues.append(f"【錯字】出現簡體字：{'、'.join(sc)}，請全部改成台灣正體字。")
     if URL_RE.search(body):
@@ -506,7 +524,19 @@ def rule_check(draft: dict, extra_ok: str = "") -> list[str]:
         issues.append(f"【規則】內文約 {n} 字，太長，請精簡到 1000 字左右。")
     if re.search(r"0\d{2,3}-?\d{3}-?\d{3}|LINE", body):
         issues.append("【規則】內文出現電話或 LINE，聯絡資訊只放簽名檔，請從內文刪除。")
+    issues += cardmod.check(cd)
+    if URL_RE.search(cd.all_text()) or re.search(r"0\d{2,3}-?\d{3}-?\d{3}", cd.all_text()):
+        issues.append("【配圖】配圖文字不可放網址或電話。")
     return issues
+
+
+def card_text(draft: dict) -> str:
+    """把配圖文字排成評審看得懂的純文字"""
+    c = draft.get("card") or {}
+    pts = "\n".join(f"{i}. {p}" for i, p in enumerate(c.get("points") or [], 1))
+    head = str(c.get("headline", "")).replace("\\n", "／").replace("\n", "／")
+    return (f"分類：{c.get('tag', '')}\n大標題：{head}（強調字：{c.get('highlight', '')}）\n"
+            f"副標：{c.get('subtitle', '')}\n重點：\n{pts}")
 
 
 # ════════════════════════════════════════════════════════════
@@ -544,6 +574,8 @@ class Nodes:
                                       temperature=0.7, tag=tag)
         d = parse_json(text)
         d.setdefault("hashtags", [])
+        if not isinstance(d.get("card"), dict):
+            d["card"] = {}
         return d, model
 
     def _rules(self) -> str:
@@ -578,7 +610,7 @@ class Nodes:
         return {"ok": True, "model": model, "score": score, "breakdown": bd, "feedback": fb}
 
     def judge(self, state: PostState) -> dict:
-        post = state["full_text"]
+        post = state["full_text"] + "\n\n【配圖文字】\n" + card_text(state["draft"])
         with ThreadPoolExecutor(max_workers=2) as ex:
             fg = ex.submit(self._judge_one, "gemini", post)
             fc = ex.submit(self._judge_one, "claude", post)
@@ -603,7 +635,8 @@ class Nodes:
         if not g["ok"]:
             notes.append(f"⚠️ Gemini 評審失敗，本輪只採 Claude 分數：{g['error'][:120]}")
         entry = {
-            "round": rnd, "title": state["draft"].get("title", ""), "full_text": post,
+            "round": rnd, "title": state["draft"].get("title", ""), "full_text": state["full_text"],
+            "card": state["draft"].get("card") or {},
             "gemini": g, "claude": c, "score": score, "passed": passed,
             "has_typo": has_typo, "feedback": feedback,
         }
@@ -618,6 +651,7 @@ class Nodes:
         prompt = REVISER_PROMPT.format(
             rules=self._rules(), title=d.get("title", ""), body=d.get("body", ""),
             hashtags=" ".join(d.get("hashtags", [])),
+            card=json.dumps(d.get("card") or {}, ensure_ascii=False),
             feedback="\n".join(f"{i}. {x}" for i, x in enumerate(state["feedback"], 1)))
         draft, model = self._write(prompt, tag="修改")
         rnd = state.get("round", 1) + 1
@@ -633,7 +667,8 @@ class Nodes:
         cost_note = f"💰 本篇共用 token：輸入 {u['input']:,}／輸出 {u['output']:,}" + \
                     ("（明細已記到 Langfuse）" if self.llm.tracer.on else "")
         self.llm.tracer.flush()
-        return {"final_text": best["full_text"], "first_comment": self.cfg.first_comment(),
+        return {"final_text": best["full_text"], "final_card": best.get("card") or {},
+                "first_comment": self.cfg.first_comment(),
                 "status": "awaiting_review",
                 "log": self._log(state, f"📦 定稿：第 {best['round']} 版，決策分 {best['score']}"
                                         f"{'' if best['passed'] else '（未達標，請人工把關）'}{note}",
@@ -645,7 +680,8 @@ class Nodes:
         action = (decision or {}).get("action")
         if action in ("approve", "edit"):
             text = decision.get("text") or state["final_text"]
-            return {"final_text": text, "status": "published",
+            card = decision.get("card") or state.get("final_card") or {}
+            return {"final_text": text, "final_card": card, "status": "published",
                     "log": self._log(state, "✅ 人工確認發布" + ("（含手動修改）" if action == "edit" else ""))}
         # regenerate
         avoid = (state.get("avoid_titles") or []) + [state.get("topic", {}).get("title", "")]
@@ -692,5 +728,10 @@ def initial_state(avoid_titles: list[str], hint: str = "") -> PostState:
                      avoid_titles=avoid_titles, log=[], regen_count=0)
 
 
-def resume_cmd(action: str, text: str = "", hint: str = "") -> Command:
-    return Command(resume={"action": action, "text": text, "hint": hint})
+def resume_cmd(action: str, text: str = "", hint: str = "", card: Optional[dict] = None) -> Command:
+    return Command(resume={"action": action, "text": text, "hint": hint, "card": card})
+
+
+def render_card(card: dict, date: str = "") -> bytes:
+    """定稿配圖文字 → PNG bytes"""
+    return cardmod.render(cardmod.CardData.from_dict(card, date=date))

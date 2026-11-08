@@ -5,6 +5,8 @@
 fb-daily-post/
 ├── app.py                 # Streamlit 介面：登入、生成、進度、人工確認
 ├── core.py                # LangGraph 閉環 + 雙評審 + 429 備援 + 簽名檔
+├── card.py                # 文章重點配圖（程式排版畫圖，1080×1350，零錯字）
+├── packages.txt           # Streamlit Cloud 安裝中文字型 fonts-noto-cjk（不要刪）
 ├── requirements.txt
 ├── .gitignore             # 擋掉 secrets.toml、history.json
 ├── secrets.toml.example   # secrets 範本（不含真實 key，可以上傳）
@@ -21,6 +23,12 @@ fb-daily-post/
 - 簽名檔、固定 Hashtag 由程式加上，不會打錯字
 - 程式另外硬性檢查：內文有網址、Markdown 符號、電話／LINE、字數過少或過多
 - 跑滿 3 輪仍未過，會挑分數最高的一版給你，並標示「未達標」
+
+## 配圖
+- 撰寫者每篇同時產出配圖文字（分類、大標題＋強調字、副標、3～5 個重點），評審一起檢查錯字與正確性
+- 圖片由程式排版畫出（不是 AI 生圖）→ 中文字不會亂碼、不會錯字、沒有 AI 感
+- 4 組配色（墨綠金／深藍橘／大地棕／酒紅金）依標題自動輪替；1080×1350 直式，FB 動態最佔版面
+- 確認頁可手動改配圖文字並即時預覽，發布頁可下載 PNG
 
 ## Secrets 要放什麼
 照 `secrets.toml.example` 填，必填：`APP_PASSWORD`、`GEMINI_API_KEY`、`ANTHROPIC_API_KEY`、`LICENSE_NO`。
